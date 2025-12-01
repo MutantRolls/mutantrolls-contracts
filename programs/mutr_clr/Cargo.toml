@@ -1,0 +1,21 @@
+[package]
+name = "mutr_clr"
+version = "0.1.0"
+description = "MutantRolls Combined Liquidity Reserve (CLR) Anchor program"
+edition = "2021"
+
+[lib]
+name = "mutr_clr"
+crate-type = ["cdylib", "lib"]
+
+[features]
+no-entrypoint = []
+no-idl = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = { workspace = true }
+anchor-spl = { workspace = true }
+
+

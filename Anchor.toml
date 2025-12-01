@@ -1,0 +1,18 @@
+[features]
+seeds = true
+skip-lint = false
+
+[programs.localnet]
+mutr_clr = "CLRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "echo 'No tests yet'"
+
+
