@@ -1,22 +1,33 @@
 // -----------------------------------------------------------------------------
 // MutantRolls — MUTR CLR (Combined Liquidity Reserve)
-// Solana / Anchor – Conceptual Rust Design 
+// Solana / Anchor program
 // -----------------------------------------------------------------------------
-// This file outlines the core design for the MutantRolls (MUTR) 
-// Combined Liquidity Reserve (CLR) system. The CLR acts as the 
-// central engine behind all MUTR game economics.
+// This program implements the on-chain Combined Liquidity Reserve (CLR) for
+// the MutantRolls ecosystem. The CLR acts as the central engine behind all
+// MUTR game economics.
 //
-// It describes how MUTR can be staked to mint xMUTR share-tokens,
-// how the CLR bankroll grows, how dividends are generated and paid
-// to stakers, and how the vault handles game prizes and profits.
+// Core ideas
+// ----------
+// • Users stake MUTR into a shared CLR vault and receive xMUTR share tokens.
+// • Unstaking burns xMUTR and withdraws the corresponding MUTR from the vault,
+//   with configurable stake / unstake fees that stay inside the CLR.
+// • A dividend pool lets users park their xMUTR to earn a share of recorded
+//   profits (e.g. casino / game revenue).
+// • Profits are added to the CLR vault and distributed using an
+//   acc_reward_per_share style accounting model.
+// • Games can pay prizes directly from the CLR vault using a PDA-controlled
+//   authority.
 //
-// The mechanics include:
-//   • Staking MUTR → minting xMUTR shares (liquidity provider token)
-//   • Unstaking xMUTR → withdrawing MUTR from the CLR vault
-//   • A dividend pool where users can earn a share of CLR profits
-//   • Automatic profit distribution using a reward-per-share model
-//   • Game prize payouts directly from the CLR bankroll
+// Implementation notes
+// --------------------
+// • The GlobalState account is a PDA (seed = "state") that owns both the
+//   MUTR vault and the xMUTR mint.
+// • All CPIs (mint, burn, transfer) use PDA signer seeds and strict
+//   mint/owner constraints on token accounts.
+// • Math is done in u128 with overflow checks and an explicit
+//   REWARD_PRECISION for reward accounting.
 // -----------------------------------------------------------------------------
+
 
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, Transfer};
