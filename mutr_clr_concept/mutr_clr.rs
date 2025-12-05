@@ -1,34 +1,3 @@
-// -----------------------------------------------------------------------------
-// MutantRolls — MUTR CLR (Combined Liquidity Reserve)
-// Solana / Anchor program
-// -----------------------------------------------------------------------------
-// This program implements the on-chain Combined Liquidity Reserve (CLR) for
-// the MutantRolls ecosystem. The CLR acts as the central engine behind all
-// MUTR game economics.
-//
-// Core ideas
-// ----------
-// • Users stake MUTR into a shared CLR vault and receive xMUTR share tokens.
-// • Unstaking burns xMUTR and withdraws the corresponding MUTR from the vault,
-//   with configurable stake / unstake fees that stay inside the CLR.
-// • A dividend pool lets users park their xMUTR to earn a share of recorded
-//   profits (e.g. casino / game revenue).
-// • Profits are added to the CLR vault and distributed using an
-//   acc_reward_per_share style accounting model.
-// • Games can pay prizes directly from the CLR vault using a PDA-controlled
-//   authority.
-//
-// Implementation notes
-// --------------------
-// • The GlobalState account is a PDA (seed = "state") that owns both the
-//   MUTR vault and the xMUTR mint.
-// • All CPIs (mint, burn, transfer) use PDA signer seeds and strict
-//   mint/owner constraints on token accounts.
-// • Math is done in u128 with overflow checks and an explicit
-//   REWARD_PRECISION for reward accounting.
-// -----------------------------------------------------------------------------
-
-
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, Transfer};
 
@@ -149,8 +118,37 @@ pub mod mutr_clr {
             user_state.staked_shares >= shares,
             MutrError::InsufficientShares
         );
+// IMPORTANT: snapshot vault balance & xMUTR supply before burning,
+// so the withdrawal math uses the pre-burn supply and cannot overpay.
 
-        // 1) Burn xMUTR from user
+        // Snapshot CLR vault balance and xMUTR supply before burning
+        let clr_balance_before = ctx.accounts.clr_vault.amount;
+        let xmutr_supply_before = ctx.accounts.xmutr_mint.supply;
+        require!(xmutr_supply_before > 0, MutrError::ZeroShares);
+
+        // Calculate how much MUTR these shares are worth using pre-burn values
+        let num = (clr_balance_before as u128)
+            .checked_mul(shares as u128)
+            .ok_or(MutrError::MathOverflow)?;
+        let mutr_before_fee_u128 = num
+            .checked_div(xmutr_supply_before as u128)
+            .ok_or(MutrError::MathOverflow)?;
+        let mutr_before_fee =
+            u64::try_from(mutr_before_fee_u128).map_err(|_| MutrError::MathOverflow)?;
+
+        // Apply unstake fee
+        let net_amount = apply_fee(mutr_before_fee, state.unstake_fee_bps)?;
+
+        // Safety check to ensure we never withdraw more than the vault balance
+        require!(net_amount <= clr_balance_before, MutrError::InvalidVault);
+
+        // Update user staked shares
+        user_state.staked_shares = user_state
+            .staked_shares
+            .checked_sub(shares)
+            .ok_or(MutrError::MathOverflow)?;
+
+        // Burn xMUTR from user after math is done
         let cpi_accounts = Burn {
             mint: ctx.accounts.xmutr_mint.to_account_info(),
             from: ctx.accounts.user_xmutr_account.to_account_info(),
@@ -159,29 +157,7 @@ pub mod mutr_clr {
         let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
         token::burn(cpi_ctx, shares)?;
 
-        user_state.staked_shares = user_state
-            .staked_shares
-            .checked_sub(shares)
-            .ok_or(MutrError::MathOverflow)?;
-
-        // 2) Calculate how much MUTR this share amount is worth
-        let clr_balance = ctx.accounts.clr_vault.amount;
-        let xmutr_supply = ctx.accounts.xmutr_mint.supply;
-        require!(xmutr_supply > 0, MutrError::ZeroShares);
-
-        let num = (clr_balance as u128)
-            .checked_mul(shares as u128)
-            .ok_or(MutrError::MathOverflow)?;
-        let mutt_before_fee_u128 = num
-            .checked_div(xmutr_supply as u128)
-            .ok_or(MutrError::MathOverflow)?;
-        let mutt_before_fee =
-            u64::try_from(mutt_before_fee_u128).map_err(|_| MutrError::MathOverflow)?;
-
-        // 3) Apply unstake fee
-        let net_amount = apply_fee(mutt_before_fee, state.unstake_fee_bps)?;
-
-        // 4) Transfer MUTR from CLR vault to user
+        // Transfer MUTR from CLR vault to user using PDA signer
         let signer_seeds = state_signer_seeds(state);
         let signer = &[&signer_seeds[..]];
 
@@ -304,6 +280,13 @@ pub mod mutr_clr {
     pub fn record_profit(ctx: Context<RecordProfit>, profit_amount: u64) -> Result<()> {
         let state = &mut ctx.accounts.state;
 
+        // Admin-only: `authority` signer must match `state.authority`.
+        require_keys_eq!(
+            state.authority,
+            ctx.accounts.authority.key(),
+            MutrError::Unauthorized
+        );
+
         require!(profit_amount > 0, MutrError::InvalidAmount);
         require!(state.total_dividend_shares > 0, MutrError::NoDividendShares);
 
@@ -372,6 +355,11 @@ pub mod mutr_clr {
 
     /// Pay prize to a winner from the CLR vault (for approved games later).
     pub fn send_prize(ctx: Context<SendPrize>, amount: u64) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.state.authority,
+            ctx.accounts.game.key(),
+            MutrError::Unauthorized
+        );
         require!(amount > 0, MutrError::InvalidAmount);
 
         let state = &ctx.accounts.state;
