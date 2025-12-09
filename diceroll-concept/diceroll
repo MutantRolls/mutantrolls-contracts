@@ -145,4 +145,318 @@ pub struct PlaceBet<'info> {
     /// `vault_token_account`.
     #[account(
         init_if_needed,
-        payer = play
+        payer = player,
+        space = 8 + ClrState::LEN,
+        seeds = [b"clr_state"],
+        bump,
+    )]
+    pub clr_state: Account<'info, ClrState>,
+
+    /// PDA that owns the CLR vault token account.
+    ///
+    /// Seeds: `[b"clr_vault_authority"]`.
+    /// This PDA must be set as `vault_token_account.owner`.
+    #[account(
+        seeds = [b"clr_vault_authority"],
+        bump,
+    )]
+    pub vault_authority: SystemAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Accounts for resolving a bet.
+///
+/// This:
+/// - Consumes randomness, computes the roll and win/loss.
+/// - Enforces that only the configured RNG authority can resolve bets.
+/// - On win, optionally pays out from CLR vault to player (using PDA signer).
+/// - On loss, records the loss in `ClrState.pending_loss_for_rewards`.
+/// - Automatically closes the `DiceBet` account, refunding rent to the player.
+#[derive(Accounts)]
+#[instruction(bet_id: u64)]
+pub struct ResolveBet<'info> {
+    /// Player who originally placed the bet.
+    ///
+    /// Does NOT need to sign to resolve; this account simply receives the
+    /// reclaimed lamports when the bet is closed.
+    #[account(mut)]
+    pub player: SystemAccount<'info>,
+
+    /// Player's MUTR token account.
+    #[account(
+        mut,
+        constraint = player_token_account.owner == player.key() @ DiceError::Unauthorized,
+    )]
+    pub player_token_account: Account<'info, TokenAccount>,
+
+    /// CLR vault token account used as bankroll.
+    #[account(
+        mut,
+        constraint = vault_token_account.mint == player_token_account.mint @ DiceError::InvalidMint,
+        constraint = vault_token_account.owner == vault_authority.key() @ DiceError::InvalidVaultAuthority,
+    )]
+    pub vault_token_account: Account<'info, TokenAccount>,
+
+    /// Existing DiceBet PDA for (player, bet_id).
+    ///
+    /// Closed to `player` once resolved, so each bet can only be executed once.
+    #[account(
+        mut,
+        seeds = [b"dice_bet", player.key().as_ref(), bet_id.to_le_bytes().as_ref()],
+        bump,
+        close = player,
+        constraint = bet.player == player.key() @ DiceError::Unauthorized,
+    )]
+    pub bet: Account<'info, DiceBet>,
+
+    /// Global DiceRoll CLR integration state for this program.
+    #[account(
+        mut,
+        seeds = [b"clr_state"],
+        bump,
+        constraint = clr_state.clr_vault == vault_token_account.key() @ DiceError::InvalidVault,
+    )]
+    pub clr_state: Account<'info, ClrState>,
+
+    /// PDA that owns the CLR vault token account.
+    ///
+    /// Seeds: `[b"clr_vault_authority"]`.
+    #[account(
+        seeds = [b"clr_vault_authority"],
+        bump,
+    )]
+    pub vault_authority: SystemAccount<'info>,
+
+    /// RNG authority allowed to resolve bets.
+    ///
+    /// On first use, this key is recorded into `clr_state.authorized_rng`.
+    /// Thereafter, only this same signer can resolve bets.
+    pub rng_authority: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+// -------------------------------------------------------------------------
+// Instructions
+// -------------------------------------------------------------------------
+
+/// Place a new dice bet.
+///
+/// - Initializes a `DiceBet` PDA keyed by `(player, bet_id)`.
+/// - Transfers `amount` MUTR from `player_token_account` to `vault_token_account`.
+/// - Ensures a `ClrState` exists and is pinned to the given CLR vault.
+/// - Emits a `BetPlaced` event.
+pub fn place_bet(
+    ctx: Context<PlaceBet>,
+    bet_id: u64,
+    amount: u64,
+    chance_bps: u64,
+) -> Result<()> {
+    require!(amount > 0, DiceError::InvalidAmount);
+    require!(
+        chance_bps > 0 && chance_bps <= 10_000,
+        DiceError::InvalidChanceBps
+    );
+
+    let player = &ctx.accounts.player;
+
+    // Transfer MUTR from the player to the CLR vault.
+    let cpi_accounts = Transfer {
+        from: ctx.accounts.player_token_account.to_account_info(),
+        to: ctx.accounts.vault_token_account.to_account_info(),
+        authority: player.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
+    token::transfer(cpi_ctx, amount)?;
+
+    // Initialize/validate CLR integration state.
+    let clr_state = &mut ctx.accounts.clr_state;
+    if clr_state.clr_vault == Pubkey::default() {
+        clr_state.clr_vault = ctx.accounts.vault_token_account.key();
+        clr_state.pending_loss_for_rewards = 0;
+        clr_state.authorized_rng = Pubkey::default();
+        clr_state.bump = *ctx
+            .bumps
+            .get("clr_state")
+            .ok_or(DiceError::MissingClrStateBump)?;
+    } else {
+        require_keys_eq!(
+            clr_state.clr_vault,
+            ctx.accounts.vault_token_account.key(),
+            DiceError::InvalidVault
+        );
+    }
+
+    // Initialize bet state.
+    let bet = &mut ctx.accounts.bet;
+    bet.player = player.key();
+    bet.amount = amount;
+    bet.chance_bps = chance_bps;
+    bet.roll_result = 0;
+    bet.win = false;
+    bet.payout_amount = 0;
+    bet.bump = *ctx
+        .bumps
+        .get("bet")
+        .ok_or(DiceError::MissingBetBump)?;
+
+    emit!(BetPlaced {
+        player: bet.player,
+        bet_id,
+        amount,
+        chance_bps,
+    });
+
+    Ok(())
+}
+
+/// Resolve an existing bet using RNG randomness.
+///
+/// - Computes `roll = (randomness % 10_000) + 1`.
+/// - Defines winning as `roll <= bet.chance_bps`.
+/// - Enforces that only the configured `rng_authority` may resolve.
+/// - If `win` and `payout_amount > 0`, transfers `payout_amount` MUTR
+///   from the CLR vault to the player using the `vault_authority` PDA.
+/// - If loss, increases `clr_state.pending_loss_for_rewards` by `bet.amount`
+///   (**hook into CLR reward math here**).
+/// - Emits a `BetResolved` event.
+/// - Automatically closes the `DiceBet` account (via `close = player`).
+pub fn resolve_bet(
+    ctx: Context<ResolveBet>,
+    bet_id: u64,
+    randomness: u64,
+    payout_amount: u64,
+) -> Result<()> {
+    let bet = &mut ctx.accounts.bet;
+    let clr_state = &mut ctx.accounts.clr_state;
+    let rng_authority = &ctx.accounts.rng_authority;
+
+    // Enforce RNG authority.
+    if clr_state.authorized_rng == Pubkey::default() {
+        // First resolver sets the RNG authority.
+        clr_state.authorized_rng = rng_authority.key();
+    } else {
+        require_keys_eq!(
+            clr_state.authorized_rng,
+            rng_authority.key(),
+            DiceError::UnauthorizedRngAuthority
+        );
+    }
+
+    // Compute roll and determine win/loss.
+    let roll_base = randomness % 10_000;
+    let roll = roll_base
+        .checked_add(1)
+        .ok_or(DiceError::MathOverflow)?;
+
+    let won = roll <= bet.chance_bps;
+
+    bet.roll_result = roll;
+    bet.win = won;
+    bet.payout_amount = if won { payout_amount } else { 0 };
+
+    // Settlement from CLR vault to player on win.
+    if won && payout_amount > 0 {
+        let vault = &ctx.accounts.vault_token_account;
+        require!(
+            payout_amount as u128 <= vault.amount as u128,
+            DiceError::InsufficientVaultLiquidity
+        );
+
+        let vault_authority_bump = *ctx
+            .bumps
+            .get("vault_authority")
+            .ok_or(DiceError::MissingVaultAuthorityBump)?;
+        let vault_seeds: &[&[u8]] = &[
+            b"clr_vault_authority",
+            &[vault_authority_bump],
+        ];
+
+        let cpi_accounts = Transfer {
+            from: vault.to_account_info(),
+            to: ctx.accounts.player_token_account.to_account_info(),
+            authority: ctx.accounts.vault_authority.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            &[vault_seeds],
+        );
+        token::transfer(cpi_ctx, payout_amount)?;
+    }
+
+    // Loss: record the loss for CLR rewards.
+    if !won {
+        clr_state.pending_loss_for_rewards = clr_state
+            .pending_loss_for_rewards
+            .checked_add(bet.amount)
+            .ok_or(DiceError::MathOverflow)?;
+        // hook into CLR reward math here
+    }
+
+    emit!(BetResolved {
+        player: bet.player,
+        bet_id,
+        roll_result: bet.roll_result,
+        win: bet.win,
+        payout_amount: bet.payout_amount,
+    });
+
+    // `bet` account is closed automatically to `player` by Anchor.
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
+// Events
+// -------------------------------------------------------------------------
+
+#[event]
+pub struct BetPlaced {
+    pub player: Pubkey,
+    pub bet_id: u64,
+    pub amount: u64,
+    pub chance_bps: u64,
+}
+
+#[event]
+pub struct BetResolved {
+    pub player: Pubkey,
+    pub bet_id: u64,
+    pub roll_result: u64,
+    pub win: bool,
+    pub payout_amount: u64,
+}
+
+// -------------------------------------------------------------------------
+// Errors
+// -------------------------------------------------------------------------
+
+#[error_code]
+pub enum DiceError {
+    #[msg("Invalid amount")]
+    InvalidAmount,
+    #[msg("Invalid chance basis points (must be between 1 and 10_000)")]
+    InvalidChanceBps,
+    #[msg("Unauthorized")]
+    Unauthorized,
+    #[msg("Unauthorized RNG authority")]
+    UnauthorizedRngAuthority,
+    #[msg("Insufficient vault liquidity for payout")]
+    InsufficientVaultLiquidity,
+    #[msg("Math overflow")]
+    MathOverflow,
+    #[msg("Invalid mint")]
+    InvalidMint,
+    #[msg("Invalid CLR vault")]
+    InvalidVault,
+    #[msg("Invalid CLR vault authority for vault token account")]
+    InvalidVaultAuthority,
+    #[msg("Missing CLR state PDA bump")]
+    MissingClrStateBump,
+    #[msg("Missing DiceBet PDA bump")]
+    MissingBetBump,
+    #[msg("Missing vault authority PDA bump")]
+    MissingVaultAuthorityBump,
+}
